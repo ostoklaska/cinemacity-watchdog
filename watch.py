@@ -135,7 +135,11 @@ def collect():
                     "datetime": e["eventDateTime"],
                     "auditorium": e.get("auditorium"),
                     "attrs": e.get("attributeIds", []),
-                    "booking": e.get("bookingLink"),
+                    # Pozor na pole bookingLink — vede na tickets.cinemacity.cz
+                    # a vrací 404. Web sám používá booking-router (viz
+                    # bookingServiceUrl na stránce filmu): ten odpoví stránkou
+                    # se samoodesílacím POST formulářem na nákupní systém.
+                    "booking": e.get("bookingRouterLaunchLink") or e.get("bookingLink"),
                     "soldOut": bool(e.get("soldOut")),
                 }
     return found
