@@ -135,11 +135,15 @@ def collect():
                     "datetime": e["eventDateTime"],
                     "auditorium": e.get("auditorium"),
                     "attrs": e.get("attributeIds", []),
-                    # Pozor na pole bookingLink — vede na tickets.cinemacity.cz
-                    # a vrací 404. Web sám používá booking-router (viz
-                    # bookingServiceUrl na stránce filmu): ten odpoví stránkou
-                    # se samoodesílacím POST formulářem na nákupní systém.
-                    "booking": e.get("bookingRouterLaunchLink") or e.get("bookingLink"),
+                    # Žádné z polí, která API nabízí, není použitelné jako
+                    # odkaz: bookingLink vrací na GET 404, obsoleteBookingUrl
+                    # je i podle názvu mrtvý a bookingRouterLaunchLink vede na
+                    # stránku se samoodesílacím POST formulářem, jehož cíl
+                    # (tickets.rel.…) na přímý GET odpoví 403. Ten POST ale
+                    # skončí na prosté adrese /order/{id}, která funguje i na
+                    # GET a otevře rovnou výběr sedadel. Pozor, parametr lang
+                    # tady dělá 404 — musí se vynechat.
+                    "booking": f"https://tickets.cinemacity.cz/order/{e.get('presentationCode') or e['id']}",
                     "soldOut": bool(e.get("soldOut")),
                 }
     return found
