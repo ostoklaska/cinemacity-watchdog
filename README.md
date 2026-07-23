@@ -23,6 +23,13 @@ Běží v GitHub Actions, takže funguje i když je Mac vypnutý.
 - Nová představení → issue s časem, sálem, příznaky (70mm / titulky / vyprodáno)
   a přímým odkazem na nákup vstupenky. Hlásí se i termíny, které z rozpisu
   **zmizely** (zrušené projekce).
+- Issue se **hned po založení zavírá**. Slouží jen jako doručovací kanál pro
+  e-mail, který GitHub pošle už při jeho vzniku — seznam otevřených issues tak
+  zůstává prázdný a nic není potřeba uklízet ručně. Obsah zůstává čitelný mezi
+  zavřenými.
+- Časy se počítají v zóně kina (`Europe/Prague`), ne v UTC runneru. Bez toho
+  by projekce, která právě doběhla, vypadala jako budoucí a při zmizení
+  z rozpisu by se falešně nahlásila jako zrušená.
 
 Jeden běh je ~45 HTTP dotazů a trvá ~20 sekund.
 

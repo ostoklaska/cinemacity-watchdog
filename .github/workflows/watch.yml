@@ -62,10 +62,15 @@ jobs:
           # Přiřazení vlastníkovi je klíčové: GitHub posílá e-mail defaultně jen
           # u "Participating" notifikací (přiřazení, zmínky). Pouhé "Watching"
           # repa dává jen web/mobile notifikaci, e-mail je tam vypnutý.
-          gh issue create \
+          url=$(gh issue create \
             --title "$(cat title.txt)" \
             --body-file report.md \
-            --assignee "${{ github.repository_owner }}"
+            --assignee "${{ github.repository_owner }}")
+          echo "Založeno: $url"
+          # Issue je jen doručovací kanál pro notifikaci — e-mail odejde už při
+          # založení, takže ho rovnou zavíráme a seznam otevřených zůstává
+          # prázdný. Obsah zůstane čitelný mezi zavřenými issues.
+          gh issue close "$url" --reason completed
 
       - name: Uložit stav zpátky do repa
         run: |
