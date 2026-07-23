@@ -1,13 +1,18 @@
 name: Cinema City watchdog
 
-# Každou půlhodinu zkontroluje rozpis Cinema City a když přibudou termíny
-# Odyssei v IMAXu, založí issue (GitHub z něj pošle e-mail i push do appky).
-# Repo je veřejné, takže se minuty Actions nepočítají do free kvóty a hustší
-# cadence nic nestojí. Minuty schválně mimo :00 a :30 — v těchto špičkách
-# GitHub cron nejvíc zahazuje běhy.
+# Zkontroluje rozpis Cinema City a když přibudou termíny Odyssei v IMAXu,
+# založí issue (GitHub z něj pošle e-mail i push do appky).
+#
+# Naplánováno 4× za hodinu, i když cílem je detekce do ~30 minut: GitHub
+# u scheduled workflows běhy pod zátěží houfně zahazuje (naměřeno 1 z 8).
+# Přebývající běhy nic nestojí (veřejné repo) a nic nerozbijí — hlášení se
+# odvíjí od stavu v state/seen.json, ne od času, takže běh navíc jen zjistí,
+# že se nic nezměnilo, a mlčí. Minuty schválně mimo :00 a :30 a rozprostřené,
+# ať netrefí stejnou špičku.
 on:
   schedule:
-    - cron: "13,43 * * * *"
+    - cron: "8,38 * * * *"
+    - cron: "21,51 * * * *"
   workflow_dispatch:
     inputs:
       force_report:

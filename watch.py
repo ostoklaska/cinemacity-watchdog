@@ -138,6 +138,16 @@ def load_state(path):
 
 
 def save_state(path, events):
+    """Zapíše stav, ale jen když se změnila množina představení.
+
+    Kdyby se soubor přepisoval při každém běhu, měnilo by se v něm razítko
+    "updated" a workflow by si po sobě commitoval prázdnou změnu 48× denně.
+    Rozhoduje proto seznam ID — to je přesně to, na čem stojí hlášení.
+    Volatilní pole (soldOut) se tím pádem neaktualizují; drží se hodnota
+    z chvíle, kdy se představení objevilo poprvé, což je i to, co se hlásí.
+    """
+    if set(events) == set(load_state(path).get("events", {})):
+        return False
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     payload = {
         "updated": datetime.now().replace(microsecond=0).isoformat(),
@@ -146,6 +156,7 @@ def save_state(path, events):
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=1, sort_keys=False)
         fh.write("\n")
+    return True
 
 
 def prune_past(events):
