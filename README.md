@@ -1,7 +1,8 @@
 # cinemacity-watchdog
 
 Hlídá rozpis [Cinema City](https://www.cinemacity.cz) a když přibude nový termín
-**Odyssei v IMAXu**, založí v tomhle repu issue a **přiřadí ho vlastníkovi repa**.
+**Odyssei v IMAXu** — nebo se u už známého termínu **uvolní místo v zadních
+řadách** — založí v tomhle repu issue a **přiřadí ho vlastníkovi repa**.
 GitHub z něj pošle e-mail i push do mobilní appky.
 
 Na přiřazení záleží: e-mail chodí ve výchozím nastavení jen u „Participating"
@@ -23,6 +24,9 @@ Běží v GitHub Actions, takže funguje i když je Mac vypnutý.
 - Nová představení → issue s časem, sálem, příznaky (70mm / titulky / vyprodáno)
   a přímým odkazem na nákup vstupenky. Hlásí se i termíny, které z rozpisu
   **zmizely** (zrušené projekce).
+- U každého budoucího termínu se navíc kontroluje **obsazenost konkrétních
+  sedadel** a hlásí se, když se nově uvolní místo v řadě 3 a dál. Podrobnosti
+  níže v [Hlídání volných míst](#hlídání-volných-míst).
 - Issue se **hned po založení zavírá**. Slouží jen jako doručovací kanál pro
   e-mail, který GitHub pošle už při jeho vzniku — seznam otevřených issues tak
   zůstává prázdný a nic není potřeba uklízet ručně. Obsah zůstává čitelný mezi
@@ -31,7 +35,42 @@ Běží v GitHub Actions, takže funguje i když je Mac vypnutý.
   by projekce, která právě doběhla, vypadala jako budoucí a při zmizení
   z rozpisu by se falešně nahlásila jako zrušená.
 
-Jeden běh je ~45 HTTP dotazů a trvá ~20 sekund.
+Jeden běh je ~45 dotazů na rozpis plus 2 na každý budoucí termín kvůli místům
+(~180 celkem) a trvá ~60 sekund.
+
+## Hlídání volných míst
+
+U vyprodaných projekcí je jediná šance dostat se dál od plátna to, že někdo
+vrátí vstupenku. Watchdog proto u každého budoucího termínu kouká i na to,
+která **konkrétní sedadla** jsou volná, a ozve se, když volné místo přibude
+v řadě `BACK_ROW_MIN` (výchozí 3) a dál.
+
+Dvě věci, na kterých to stojí a které nejsou z API vidět na první pohled:
+
+- **Příznak `soldOut` z rozpisového API se nedá použít.** Zůstává na `0`
+  i u projekcí, kde je volných posledních pár sedadel v první řadě. Obsazenost
+  se proto zjišťuje z ticketingu (`tickets.cinemacity.cz/api`), ne z rozpisu.
+- **Endpoint `seats-statusV2` vrací místa VOLNÁ, ne obsazená.** Co v odpovědi
+  není, je prodané. Klíč `1_37_8` znamená sekce 1, index sedadla 37, index
+  řady 8; popisky („řada 8, sedadlo 3") se dopárují z plánu sálu
+  (`seatplanV2`), který se tahá jednou za běh a cachuje.
+
+Ticketing API odmítá dotazy bez hlavičky `uuid` chybou 403. Frontend do ní dává
+hodnotu ze stejnojmenné cookie, ale serveru stačí **jakékoli platné UUID** —
+nemusí odpovídat žádné existující session, takže si ho watchdog vyrobí sám.
+Celé to jede na čistém `urllib`, žádný headless prohlížeč není potřeba, i když
+se seat mapa v prohlížeči kreslí až JavaScriptem.
+
+Vozíčkářská místa (v plánu příznak `hc`) se **nepočítají** — jsou to vyhrazené
+pozice, ne sedadlo, které by si šlo jen tak koupit. V sále `IMAX VOLVO` jsou
+zrovna všechna v poslední řadě, takže bez téhle výjimky by watchdog hlásil
+„volno vzadu" prakticky pořád.
+
+Aby hlášení nechodilo každou půlhodinu dokola, ukládá se do stavu jen **seznam
+řad** s volným místem (ne počty sedadel, ty se mění moc často) a hlásí se jen
+řady, které oproti minule přibyly. Když se obsazenost nepodaří zjistit (výpadek
+ticketingu, ukončený předprodej), převezme se poslední známá hodnota — jinak by
+výpadek vypadal jako „místa zmizela" a jeho konec jako falešné uvolnění.
 
 ## Co přesně se hlídá
 
@@ -53,6 +92,8 @@ Chování jde změnit proměnnými prostředí ve workflow:
 | `HORIZON_DAYS` | `180` | jak daleko dopředu se ptát |
 | `HINT_ATTR` | `70-mm` | atribut pro levné dohledání kandidátských kin |
 | `REQUEST_DELAY` | `0.25` | pauza mezi dotazy na API (s) |
+| `BACK_ROW_MIN` | `3` | od které řady se místo bere jako „vzadu" (1 = u plátna) |
+| `CHECK_SEATS` | `1` | `0` vypne hlídání míst, zůstanou jen nové termíny |
 
 Hlídat cokoli jiného (třeba `FILM_PATTERN=dune`, `AUDITORIUM_PATTERN=4dx`) tedy
 znamená přepsat dvě proměnné a smazat `state/seen.json`.

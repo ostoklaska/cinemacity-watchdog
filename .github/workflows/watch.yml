@@ -47,6 +47,11 @@ jobs:
         env:
           FILM_PATTERN: odyss
           AUDITORIUM_PATTERN: imax
+          # Od které řady se místo bere jako "vzadu". 1 = nejblíž plátnu, takže
+          # 3 znamená "cokoli dál než první dvě řady". CHECK_SEATS: 0 hlídání
+          # míst vypne a zůstanou jen nové termíny.
+          BACK_ROW_MIN: "3"
+          CHECK_SEATS: "1"
         run: |
           python3 watch.py \
             --state state/seen.json \
