@@ -4,8 +4,12 @@
 Ve výchozím nastavení: film "Odyssea" v sále, jehož název obsahuje "IMAX".
 Data bere z veřejného JSON API cinemacity.cz (bez klíče, bez přihlášení).
 
-Stav (už viděná představení) drží v JSON souboru, takže při každém běhu
-hlásí jen to, co přibylo od minule.
+Kromě nových termínů hlídá i to, kdy se u známého představení uvolní místo
+v zadních řadách — u vyprodaných projekcí je to jediná šance, jak se dostat
+dál od plátna než do prvních dvou řad.
+
+Stav (už viděná představení a jejich zadní řady) drží v JSON souboru, takže
+při každém běhu hlásí jen to, co se změnilo od minule.
 """
 
 import argparse
@@ -15,6 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -33,6 +38,18 @@ HORIZON_DAYS = int(os.environ.get("HORIZON_DAYS", "180"))
 # IMAX sály. Doplňuje (nenahrazuje) sondu podle názvu sálu.
 HINT_ATTR = os.environ.get("HINT_ATTR", "70-mm")
 DELAY = float(os.environ.get("REQUEST_DELAY", "0.25"))
+
+# Ticketing API (jiný host i jiný tvar dat než rozpis) — odtud se zjišťuje,
+# která konkrétní sedadla jsou volná.
+TICKETS = "https://tickets.cinemacity.cz/api"
+# Od které řady se místo počítá jako "vzadu". Řada 1 je nejblíž plátnu.
+BACK_ROW_MIN = int(os.environ.get("BACK_ROW_MIN", "3"))
+CHECK_SEATS = os.environ.get("CHECK_SEATS", "1").lower() not in ("0", "false", "no", "")
+# Ticketing API odmítá požadavky bez hlavičky "uuid" chybou 403. Frontend do ní
+# posílá hodnotu ze stejnojmenné cookie, serveru ale stačí jakékoli platné UUID
+# — nemusí odpovídat žádné existující session, takže si ho vyrobíme sami a
+# nemusíme kvůli tomu chodit pro cookie na objednávkovou stránku.
+SESSION_UUID = str(uuid.uuid4())
 
 CZ_DAYS = ["po", "út", "st", "čt", "pá", "so", "ne"]
 
@@ -143,10 +160,192 @@ def collect():
                     # skončí na prosté adrese /order/{id}, která funguje i na
                     # GET a otevře rovnou výběr sedadel. Pozor, parametr lang
                     # tady dělá 404 — musí se vynechat.
+                    # Pod tímhle kódem zná představení ticketing — platí jak pro
+                    # odkaz na nákup, tak pro dotaz na obsazenost sedadel.
+                    "presentation": str(e.get("presentationCode") or e["id"]),
                     "booking": f"https://tickets.cinemacity.cz/order/{e.get('presentationCode') or e['id']}",
                     "soldOut": bool(e.get("soldOut")),
                 }
     return found
+
+
+def tickets_api(path, post=False):
+    """Dotaz na ticketing API. Vrací dekódované tělo, nebo None při chybě.
+
+    Na rozdíl od api() tady výpadek nesmí shodit celý běh — místa jsou jen
+    doplňková informace a rozpis se má nahlásit i tehdy, když ticketing zlobí.
+    """
+    url = f"{TICKETS}{path}"
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json, text/plain, */*",
+        "uuid": SESSION_UUID,
+    }
+    data = None
+    if post:
+        data = b"{}"
+        headers["Content-Type"] = "application/json"
+    last = None
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last = exc
+            time.sleep(2 ** attempt)
+    print(f"  ticketing API selhalo: {url} ({last})", file=sys.stderr)
+    return None
+
+
+_SEATPLAN_CACHE = {}
+
+
+def seat_labels(venue_id, seatplan_id):
+    """Popisky sedadel sálu: {(sekce, index sedadla, index řady): (řada, sedadlo, vozíčkář)}.
+
+    Plán sálu je na všech představeních ve stejném sále totožný, takže se tahá
+    jednou za běh — jinak by to byl jeden request navíc na každý termín.
+    """
+    key = (venue_id, seatplan_id)
+    if key in _SEATPLAN_CACHE:
+        return _SEATPLAN_CACHE[key]
+
+    time.sleep(DELAY)
+    body = tickets_api(f"/seats/seatplanV2?venueId={venue_id}&seatplanId={seatplan_id}", post=True)
+    labels = {}
+    for sec_id, section in (body or {}).get("S", {}).items():
+        for group in section.get("G", {}).values():
+            for row_idx, row in group.get("R", {}).items():
+                for seat_idx, seat in row.get("S", {}).items():
+                    labels[(sec_id, seat_idx, row_idx)] = (
+                        row.get("n"),
+                        seat.get("n"),
+                        bool(seat.get("hc")),
+                    )
+    # Prázdný výsledek se schválně necachuje: kdyby plán sálu jednou selhal,
+    # zablokovalo by to kontrolu míst u všech dalších termínů ve stejném sále.
+    if labels:
+        _SEATPLAN_CACHE[key] = labels
+    return labels
+
+
+def row_number(label, fallback):
+    """Číslo řady pro porovnání s BACK_ROW_MIN; popisek nemusí být číslo."""
+    try:
+        return int(str(label).strip())
+    except (TypeError, ValueError):
+        try:
+            return int(fallback)
+        except (TypeError, ValueError):
+            return 0
+
+
+def seat_sort_key(seat):
+    try:
+        return (0, int(seat))
+    except (TypeError, ValueError):
+        return (1, str(seat))
+
+
+def seat_report(presentation_id):
+    """Rozbor volných míst pro jedno představení, nebo None když se nedá zjistit.
+
+    Pozor na dvě pasti: příznak soldOut z rozpisového API je nespolehlivý
+    (zůstává na 0 i u prakticky vyprodaných projekcí), a seats-statusV2 vrací
+    místa VOLNÁ, ne obsazená — co v odpovědi není, je prodané.
+    """
+    body = tickets_api(f"/presentations/{presentation_id}?referralMiniSiteId=0")
+    if not body or "presentation" not in body:
+        # Typicky {"error": {"error": "TICKETING_ENDED"}} u projekce, na kterou
+        # se už neprodává. Není to chyba, jen se nedá nic zjistit.
+        return None
+    pres = body["presentation"]
+
+    time.sleep(DELAY)
+    status = tickets_api(
+        f"/seats/seats-statusV2?presentationId={presentation_id}"
+        f"&venueTypeId={pres.get('venueTypeId')}"
+        f"&isReserved={1 if pres.get('isReserved') else 0}"
+    )
+    if not status or "seats" not in status:
+        return None
+
+    labels = seat_labels(pres.get("venueId"), pres.get("seatplanId"))
+    if not labels:
+        return None
+
+    free = []
+    for key in status["seats"]:
+        parts = key.split("_")
+        if len(parts) != 3:
+            continue
+        label = labels.get(tuple(parts))
+        if not label:
+            continue
+        row_label, seat_label, is_hc = label
+        free.append(
+            {
+                "row": row_number(row_label, parts[2]),
+                "rowLabel": row_label,
+                "seat": seat_label,
+                "hc": is_hc,
+            }
+        )
+
+    # Vozíčkářská místa se nepočítají — jsou to vyhrazené pozice, ne sedadlo,
+    # které by si člověk mohl jen tak koupit.
+    back = sorted(
+        (s for s in free if s["row"] >= BACK_ROW_MIN and not s["hc"]),
+        key=lambda s: (s["row"], seat_sort_key(s["seat"])),
+    )
+    return {
+        "free": len(free),
+        "back": back,
+        "backRows": sorted({s["row"] for s in back}),
+    }
+
+
+def check_seats(current, known):
+    """Doplní představením seznam zadních řad s volnými místy.
+
+    Vrací {event_id: rozbor} pro živé hlášení; do stavu se ukládá jen strohý
+    seznam řad (klíč backRows), aby soubor nebobtnal a neměnil se při každém
+    prodaném sedadle.
+
+    Když se místa nepodaří zjistit, převezme se poslední známá hodnota. Kdyby
+    se totiž výpadek zapsal jako "žádná volná místa", vypadalo by následující
+    úspěšné čtení jako čerstvé uvolnění a přišlo by falešné hlášení.
+    """
+    live = {}
+    moment = now().isoformat()
+    for eid, event in sorted(current.items(), key=lambda kv: kv[1]["datetime"]):
+        previous = known.get(eid, {}).get("backRows")
+        if event["datetime"] < moment:
+            event["backRows"] = previous if previous is not None else []
+            continue
+        info = seat_report(event.get("presentation") or event["id"])
+        if info is None:
+            event["backRows"] = previous if previous is not None else []
+            continue
+        live[eid] = info
+        event["backRows"] = info["backRows"]
+    return live
+
+
+def newly_opened(current, known, live):
+    """Představení, kde od minule přibyla zadní řada s volným místem."""
+    opened = []
+    for eid, event in current.items():
+        before = known.get(eid, {}).get("backRows")
+        if before is None:
+            # Buď úplně nový termín (hlásí se zvlášť), nebo záznam ze stavu
+            # pořízeného ještě před hlídáním míst — není s čím porovnávat.
+            continue
+        fresh = sorted(set(event.get("backRows", [])) - set(before))
+        if fresh:
+            opened.append((event, fresh, live.get(eid)))
+    return sorted(opened, key=lambda item: item[0]["datetime"])
 
 
 def load_state(path):
@@ -157,16 +356,23 @@ def load_state(path):
         return {"updated": None, "events": {}}
 
 
+def signature(events):
+    """To ze stavu, na čem stojí hlášení — jen kvůli tomu se soubor přepisuje."""
+    return {eid: list(e.get("backRows", [])) for eid, e in events.items()}
+
+
 def save_state(path, events):
-    """Zapíše stav, ale jen když se změnila množina představení.
+    """Zapíše stav, ale jen když se změnilo něco, co se hlásí.
 
     Kdyby se soubor přepisoval při každém běhu, měnilo by se v něm razítko
     "updated" a workflow by si po sobě commitoval prázdnou změnu 48× denně.
-    Rozhoduje proto seznam ID — to je přesně to, na čem stojí hlášení.
-    Volatilní pole (soldOut) se tím pádem neaktualizují; drží se hodnota
-    z chvíle, kdy se představení objevilo poprvé, což je i to, co se hlásí.
+    Rozhoduje proto seznam ID plus obsazenost zadních řad — a schválně jen
+    seznam řad, ne počty volných sedadel: ty se u živého předprodeje mění
+    každou chvíli a stav by se commitoval pořád dokola.
+    Ostatní volatilní pole (soldOut) se tím pádem neaktualizují; drží se
+    hodnota z chvíle, kdy se představení objevilo poprvé.
     """
-    if set(events) == set(load_state(path).get("events", {})):
+    if signature(events) == signature(load_state(path).get("events", {})):
         return False
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     payload = {
@@ -195,9 +401,29 @@ def fmt_short(iso):
     return f"{dt.day}. {dt.month}."
 
 
-def render(new_events, gone_events):
+def fmt_back(back):
+    """Volná zadní místa jako "řada 8: 3, 4 · řada 9: 12"."""
+    by_row = {}
+    for seat in back:
+        by_row.setdefault(seat["rowLabel"], []).append(seat["seat"])
+    return " · ".join(f"řada {row}: {', '.join(seats)}" for row, seats in by_row.items())
+
+
+def render(new_events, gone_events, opened=(), live=None):
     """Markdown tělo hlášení."""
+    live = live or {}
     lines = []
+    if opened:
+        lines.append(f"### Uvolnila se místa vzadu ({len(opened)})\n")
+        for event, fresh, info in opened:
+            rows = ", ".join(str(r) for r in fresh)
+            lines.append(f"**{fmt_dt(event['datetime'])}** · {event['cinema']} · {event['auditorium']}\n")
+            lines.append(f"- nově volno v řadě {rows}")
+            if info and info["back"]:
+                lines.append(f"- celkem vzadu: {fmt_back(info['back'])}")
+            if event["booking"]:
+                lines.append(f"- [koupit]({event['booking']})")
+            lines.append("")
     if new_events:
         lines.append(f"### Nově vypsáno ({len(new_events)})\n")
         for cinema, group in group_by_cinema(new_events):
@@ -215,6 +441,10 @@ def render(new_events, gone_events):
                 suffix = f" — {', '.join(flags)}" if flags else ""
                 link = f" — [koupit]({e['booking']})" if e["booking"] else ""
                 lines.append(f"- {fmt_dt(e['datetime'])} · {e['auditorium']}{suffix}{link}")
+                info = live.get(e["id"])
+                if info is not None:
+                    detail = fmt_back(info["back"]) if info["back"] else "vzadu nic volného"
+                    lines.append(f"  - {detail}")
             lines.append("")
     if gone_events:
         lines.append(f"### Zmizelo z rozpisu ({len(gone_events)})\n")
@@ -223,16 +453,15 @@ def render(new_events, gone_events):
             for e in group:
                 lines.append(f"- {fmt_dt(e['datetime'])} · {e['auditorium']}")
             lines.append("")
-    film_link = next(
-        (e["filmLink"] for e in list(new_events) + list(gone_events) if e.get("filmLink")),
-        None,
-    )
+    candidates = list(new_events) + list(gone_events) + [event for event, _, _ in opened]
+    film_link = next((e["filmLink"] for e in candidates if e.get("filmLink")), None)
     if film_link:
         lines.append(f"[Stránka filmu na Cinema City]({film_link})")
     lines.append("")
     lines.append(
         f"<sub>Zkontrolováno {now():%d. %m. %Y %H:%M} · "
-        f"film ~ `{FILM_PATTERN}` · sál ~ `{AUDITORIUM_PATTERN}`</sub>"
+        f"film ~ `{FILM_PATTERN}` · sál ~ `{AUDITORIUM_PATTERN}` · "
+        f"vzadu = řada {BACK_ROW_MIN} a dál</sub>"
     )
     return "\n".join(lines)
 
@@ -244,15 +473,23 @@ def group_by_cinema(events):
     return order.items()
 
 
-def title_for(new_events):
-    film = new_events[0]["film"]
-    days = sorted({e["datetime"][:10] for e in new_events})
+def span_of(events):
+    days = sorted({e["datetime"][:10] for e in events})
     span = fmt_short(days[0])
     if len(days) > 1:
         span += f"–{fmt_short(days[-1])}"
-    n = len(new_events)
-    word = "nový termín" if n == 1 else ("nové termíny" if n < 5 else "nových termínů")
-    return f"🎬 {film} v IMAXu: {n} {word} ({span})"
+    return span
+
+
+def title_for(new_events, opened=()):
+    if new_events:
+        n = len(new_events)
+        word = "nový termín" if n == 1 else ("nové termíny" if n < 5 else "nových termínů")
+        return f"🎬 {new_events[0]['film']} v IMAXu: {n} {word} ({span_of(new_events)})"
+    events = [event for event, _, _ in opened]
+    n = len(events)
+    word = "termínu" if n == 1 else ("termínů" if n < 5 else "termínů")
+    return f"🎟️ {events[0]['film']} v IMAXu: volná místa vzadu u {n} {word} ({span_of(events)})"
 
 
 def gh_output(**kwargs):
@@ -279,6 +516,11 @@ def main():
 
     print(f"Nalezeno {len(current)} hlídaných představení, ve stavu {len(known)}.")
 
+    live = check_seats(current, known) if CHECK_SEATS else {}
+    if live:
+        with_back = sum(1 for info in live.values() if info["back"])
+        print(f"Obsazenost ověřena u {len(live)}, volno vzadu u {with_back}.")
+
     if args.seed:
         save_state(args.state, prune_past(current))
         print(f"Stav zapsán do {args.state} (seed, nic se nehlásí).")
@@ -288,6 +530,7 @@ def main():
     if args.force_report:
         new_events = sorted(current.values(), key=lambda e: e["datetime"])
         gone = []
+        opened = []
     else:
         new_events = sorted(
             (v for k, v in current.items() if k not in known),
@@ -298,16 +541,20 @@ def main():
             (v for k, v in known.items() if k not in current and v["datetime"] > future),
             key=lambda e: e["datetime"],
         )
+        opened = newly_opened(current, known, live)
 
     save_state(args.state, prune_past(current))
 
-    if not new_events and not gone:
+    if not new_events and not gone and not opened:
         print("Nic nového.")
         gh_output(has_news="false")
         return
 
-    body = render(new_events, gone)
-    title = title_for(new_events) if new_events else "🎬 Odyssea v IMAXu: zrušené termíny"
+    body = render(new_events, gone, opened, live)
+    if new_events or opened:
+        title = title_for(new_events, opened)
+    else:
+        title = "🎬 Odyssea v IMAXu: zrušené termíny"
     with open(args.report, "w", encoding="utf-8") as fh:
         fh.write(body + "\n")
     with open(args.title, "w", encoding="utf-8") as fh:
